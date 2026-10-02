@@ -200,4 +200,9 @@ static/         the web UI (vanilla JS, no build step)
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Copyright (C) 2026 The Honeybee authors.
+
+Honeybee is free software: you can redistribute it and/or modify it under the terms of the
+[GNU General Public License](LICENSE) as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version. It is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; see the license for details.
