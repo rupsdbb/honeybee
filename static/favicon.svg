@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="114 56 82 82">
+  <style>
+    .ink { fill: #3a2a14; }
+    .line { stroke: #3a2a14; }
+    .antenna { stroke: #3a2a14; }
+    .antenna-tip { fill: #3a2a14; }
+    @media (prefers-color-scheme: dark) {
+      .antenna { stroke: #ffd23f; }
+      .antenna-tip { fill: #ffd23f; }
+    }
+  </style>
+  <ellipse cx="133" cy="82" rx="13" ry="16" transform="rotate(-24 133 82)" fill="#eef8ff" class="line" stroke-width="3"/>
+  <ellipse cx="177" cy="82" rx="13" ry="16" transform="rotate(24 177 82)" fill="#eef8ff" class="line" stroke-width="3"/>
+  <path d="M148 81 Q144 69 137 65" fill="none" class="antenna" stroke-width="3" stroke-linecap="round"/>
+  <path d="M162 81 Q166 69 173 65" fill="none" class="antenna" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="136" cy="64" r="4.5" class="antenna-tip"/>
+  <circle cx="174" cy="64" r="4.5" class="antenna-tip"/>
+  <ellipse cx="155" cy="106" rx="32" ry="28" fill="#ffd23f" class="line" stroke-width="3"/>
+  <path d="M131 118 Q155 128 179 118" fill="none" class="line" stroke-width="6" stroke-linecap="round"/>
+  <path d="M140 127 Q155 133 170 127" fill="none" class="line" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="144" cy="99" r="5" class="ink"/>
+  <circle cx="166" cy="99" r="5" class="ink"/>
+  <circle cx="145.8" cy="97.2" r="1.8" fill="#ffffff"/>
+  <circle cx="167.8" cy="97.2" r="1.8" fill="#ffffff"/>
+  <ellipse cx="136" cy="107" rx="5" ry="3" fill="#ff7f7f" opacity="0.75"/>
+  <ellipse cx="174" cy="107" rx="5" ry="3" fill="#ff7f7f" opacity="0.75"/>
+  <path d="M150 106 Q155 111 160 106" fill="none" class="line" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

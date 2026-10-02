@@ -1,0 +1,18 @@
+services:
+  honeybee:
+    build: .
+    image: honeybee
+    restart: unless-stopped
+    ports:
+      - "8585:8585"
+    env_file: .env
+    volumes:
+      - honeybee-data:/data
+      # For a self-signed / mkcert electrs certificate:
+      # - ./rootCA.pem:/etc/honeybee/rootCA.pem:ro
+    # If electrs runs on the Docker host, use host.docker.internal:50001
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  honeybee-data:

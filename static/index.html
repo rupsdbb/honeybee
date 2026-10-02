@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Honeybee</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="login" class="login" hidden>
+    <form id="login-form" class="login-card">
+      <img src="/favicon.svg" alt="" class="login-logo">
+      <h1>Honeybee</h1>
+      <p class="muted">Watch-only wallet</p>
+      <label class="field">
+        <span>Password</span>
+        <input type="password" id="login-password" autocomplete="current-password" required autofocus>
+      </label>
+      <p id="login-error" class="form-error" hidden></p>
+      <button type="submit" class="btn primary wide">Unlock</button>
+    </form>
+  </div>
+
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <button id="menu-btn" class="icon-btn only-mobile" aria-label="Wallets">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <a href="#/" class="brand"><img src="/favicon.svg" alt="" width="24" height="24"><span>Honeybee</span></a>
+      <div id="conn" class="conn" title=""></div>
+      <div class="topbar-actions">
+        <div class="seg" role="group" aria-label="Unit">
+          <button data-unit="btc" class="seg-btn">BTC</button>
+          <button data-unit="sat" class="seg-btn">sats</button>
+        </div>
+        <button id="privacy-btn" class="icon-btn" title="Hide balances" aria-label="Hide balances">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+        <button id="logout-btn" class="icon-btn" title="Lock" aria-label="Lock" hidden>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <aside id="sidebar" class="sidebar">
+      <div class="portfolio">
+        <div class="muted small">All wallets</div>
+        <div id="portfolio-total" class="portfolio-total amount">–</div>
+      </div>
+      <nav id="wallet-list" class="wallet-list"></nav>
+      <button id="add-wallet-btn" class="btn ghost wide">
+        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        Add wallet
+      </button>
+      <div class="sidebar-foot muted small">
+        <span id="version"></span> · watch-only
+      </div>
+    </aside>
+    <div id="scrim" class="scrim"></div>
+
+    <main id="main" class="main"></main>
+  </div>
+
+  <dialog id="modal" class="modal">
+    <div class="modal-inner">
+      <header class="modal-head">
+        <h2 id="modal-title"></h2>
+        <button class="icon-btn" data-close aria-label="Close">
+          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </header>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

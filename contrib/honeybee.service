@@ -1,0 +1,36 @@
+# /etc/systemd/system/honeybee.service
+# sudo useradd --system --home /var/lib/honeybee honeybee
+# sudo install -m 0755 target/release/honeybee /usr/local/bin/
+# sudo install -m 0640 -o root -g honeybee .env /etc/honeybee.env
+# sudo systemctl enable --now honeybee
+[Unit]
+Description=Honeybee watch-only Bitcoin wallet
+After=network-online.target electrs.service
+Wants=network-online.target
+
+[Service]
+User=honeybee
+EnvironmentFile=/etc/honeybee.env
+Environment=HONEYBEE_DATA_DIR=/var/lib/honeybee
+StateDirectory=honeybee
+ExecStart=/usr/local/bin/honeybee
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

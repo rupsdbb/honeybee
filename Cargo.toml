@@ -1,0 +1,39 @@
+[package]
+name = "honeybee"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Self-hosted, watch-only Bitcoin wallet web UI for electrs and other Electrum servers"
+license = "MIT"
+readme = "README.md"
+keywords = ["bitcoin", "electrum", "electrs", "wallet", "watch-only"]
+categories = ["cryptography::cryptocurrencies", "web-programming::http-server"]
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+futures = "0.3.34"
+hex = "0.4.3"
+miniscript = "13.1.0"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+rand = "0.10.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls-native-certs = "0.8.4"
+scrypt = "0.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.dev.package."*"]
+# Optimize dependencies (scrypt, secp256k1) even in debug builds.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
