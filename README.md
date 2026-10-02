@@ -45,7 +45,7 @@ requests: the only server Honeybee talks to is the Electrum server you configure
 Requires Rust 1.88+.
 
 ```bash
-git clone https://github.com/YOUR_USER/honeybee && cd honeybee
+git clone https://github.com/rupsdbb/honeybee && cd honeybee
 cargo build --release
 ./target/release/honeybee --electrum tcp://127.0.0.1:50001
 ```
