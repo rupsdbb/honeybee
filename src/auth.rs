@@ -2,11 +2,12 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
 use miniscript::bitcoin::hashes::{Hash, HashEngine, Hmac, HmacEngine, sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const COOKIE_NAME: &str = "honeybee_session";
 pub const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -17,6 +18,8 @@ const SCRYPT_P: u32 = 1;
 
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// Password verifications (scrypt, ~32 MiB each) allowed to run at once.
+const MAX_CONCURRENT_VERIFY: usize = 2;
 
 /// Hash a password as `scrypt$log_n$r$p$salt$hash` (hex).
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
@@ -81,12 +84,58 @@ pub struct Auth {
     /// `None` when authentication is disabled.
     password_hash: Option<String>,
     secret: [u8; 32],
-    failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    attempts: Mutex<HashMap<IpAddr, Attempts>>,
+    verify_slots: Arc<Semaphore>,
+}
+
+#[derive(Default)]
+struct Attempts {
+    failures: u32,
+    /// When the first failure in the current window happened.
+    since: Option<Instant>,
+    /// Attempts that passed the limit check and are not finished yet.
+    in_flight: u32,
+}
+
+/// A login attempt admitted by [`Auth::begin_attempt`]. Dropping it without
+/// calling [`LoginAttempt::succeeded`] counts as a failure, so an attempt
+/// that is cancelled or panics still uses up one of the allowed tries.
+pub struct LoginAttempt<'a> {
+    auth: &'a Auth,
+    ip: IpAddr,
+    succeeded: bool,
+}
+
+impl LoginAttempt<'_> {
+    pub fn succeeded(mut self) {
+        self.succeeded = true;
+    }
+}
+
+impl Drop for LoginAttempt<'_> {
+    fn drop(&mut self) {
+        let mut attempts = self.auth.attempts.lock().unwrap();
+        let Some(a) = attempts.get_mut(&self.ip) else { return };
+        a.in_flight -= 1;
+        if self.succeeded {
+            if a.in_flight == 0 && a.failures == 0 {
+                attempts.remove(&self.ip);
+            }
+        } else {
+            a.failures += 1;
+            a.since.get_or_insert_with(Instant::now);
+        }
+    }
 }
 
 impl Auth {
     pub fn new(password_hash: Option<String>, secret: [u8; 32]) -> Auth {
-        Auth { password_hash, secret, failures: Mutex::new(HashMap::new()) }
+        Auth {
+            password_hash,
+            secret,
+            attempts: Mutex::new(HashMap::new()),
+            verify_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFY)),
+        }
     }
 
     pub fn required(&self) -> bool {
@@ -114,22 +163,27 @@ impl Auth {
         expiry > now_secs() && constant_time_eq(mac.as_bytes(), self.mac(expiry).as_bytes())
     }
 
-    /// Returns Err with a message if this client is temporarily locked out.
-    pub fn check_rate_limit(&self, ip: IpAddr) -> Result<(), String> {
-        let mut failures = self.failures.lock().unwrap();
-        failures.retain(|_, (_, since)| since.elapsed() < FAILURE_WINDOW);
-        match failures.get(&ip) {
-            Some((count, _)) if *count >= MAX_FAILURES => {
-                Err("Too many failed attempts. Try again in a few minutes.".into())
-            }
-            _ => Ok(()),
+    /// Admit a login attempt from `ip`, or return Err with a message if this
+    /// client is temporarily locked out. Attempts still being verified count
+    /// against the limit, so concurrent requests cannot exceed it.
+    pub fn begin_attempt(&self, ip: IpAddr) -> Result<LoginAttempt<'_>, String> {
+        let mut attempts = self.attempts.lock().unwrap();
+        attempts.retain(|_, a| a.in_flight > 0 || a.since.is_some_and(|s| s.elapsed() < FAILURE_WINDOW));
+        let a = attempts.entry(ip).or_default();
+        if a.since.is_some_and(|s| s.elapsed() >= FAILURE_WINDOW) {
+            a.failures = 0;
+            a.since = None;
         }
+        if a.failures + a.in_flight >= MAX_FAILURES {
+            return Err("Too many failed attempts. Try again in a few minutes.".into());
+        }
+        a.in_flight += 1;
+        Ok(LoginAttempt { auth: self, ip, succeeded: false })
     }
 
-    pub fn record_failure(&self, ip: IpAddr) {
-        let mut failures = self.failures.lock().unwrap();
-        let entry = failures.entry(ip).or_insert((0, Instant::now()));
-        entry.0 += 1;
+    /// Wait for one of the few slots in which a password may be verified.
+    pub async fn verify_slot(&self) -> OwnedSemaphorePermit {
+        self.verify_slots.clone().acquire_owned().await.expect("semaphore never closed")
     }
 
     /// Slow (scrypt); call from a blocking context.
@@ -165,5 +219,31 @@ mod tests {
         assert!(!auth.check_token("1.abc"));
         let other = Auth::new(Some(hash_password("pw2").unwrap()), [7; 32]);
         assert!(!other.check_token(&t), "a password change must invalidate sessions");
+    }
+
+    #[test]
+    fn concurrent_attempts_count_against_the_limit() {
+        let auth = Auth::new(None, [0; 32]);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let in_flight: Vec<_> = (0..MAX_FAILURES).map(|_| auth.begin_attempt(ip).unwrap()).collect();
+        assert!(auth.begin_attempt(ip).is_err(), "an 11th concurrent attempt must be refused");
+        assert!(auth.begin_attempt("192.0.2.2".parse().unwrap()).is_ok(), "other clients are unaffected");
+        drop(in_flight); // all failed
+        assert!(auth.begin_attempt(ip).is_err());
+    }
+
+    #[test]
+    fn success_frees_the_slot_without_counting_a_failure() {
+        let auth = Auth::new(None, [0; 32]);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..MAX_FAILURES * 2 {
+            auth.begin_attempt(ip).unwrap().succeeded();
+        }
+        for _ in 0..MAX_FAILURES - 1 {
+            drop(auth.begin_attempt(ip).unwrap());
+        }
+        auth.begin_attempt(ip).unwrap().succeeded();
+        drop(auth.begin_attempt(ip).unwrap());
+        assert!(auth.begin_attempt(ip).is_err());
     }
 }
