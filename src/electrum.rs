@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio_rustls::TlsConnector;
@@ -25,11 +25,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const WAIT_CONNECTED_TIMEOUT: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_IN_FLIGHT: usize = 48;
-/// Largest message accepted from the server. Big enough for any transaction
-/// (hex) or a long address history; anything larger drops the connection.
-const MAX_MESSAGE_SIZE: usize = 32 << 20;
-/// Outgoing lines buffered per connection; senders wait when it is full.
-const SEND_QUEUE: usize = MAX_IN_FLIGHT + 16;
 
 #[derive(Debug)]
 pub enum ElectrumError {
@@ -74,7 +69,7 @@ struct Inner {
     tls: Option<(TlsConnector, ServerName<'static>)>,
     next_id: AtomicU64,
     pending: Mutex<Pending>,
-    writer: Mutex<Option<mpsc::Sender<String>>>,
+    writer: Mutex<Option<mpsc::UnboundedSender<String>>>,
     status: watch::Sender<ConnStatus>,
     notifications: broadcast::Sender<Notification>,
     in_flight: Semaphore,
@@ -163,23 +158,23 @@ impl ElectrumClient {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string() + "\n";
         let (tx, rx) = oneshot::channel();
-        let Some(writer) = self.inner.writer.lock().unwrap().clone() else {
-            return Err(ElectrumError::Transport("not connected".into()));
-        };
         self.inner.pending.lock().unwrap().insert(id, tx);
-        let exchange = async {
-            // Waits (backpressure) while the send queue is full.
-            writer.send(line).await.map_err(|_| ElectrumError::Transport("not connected".into()))?;
-            rx.await.map_err(|_| ElectrumError::Transport("connection closed".into()))?
+        let sent = match &*self.inner.writer.lock().unwrap() {
+            Some(w) => w.send(line).is_ok(),
+            None => false,
         };
-        let result = match tokio::time::timeout(REQUEST_TIMEOUT, exchange).await {
-            Ok(result) => result,
-            Err(_) => Err(ElectrumError::Transport(format!("{method} timed out"))),
-        };
-        if result.is_err() {
+        if !sent {
             self.inner.pending.lock().unwrap().remove(&id);
+            return Err(ElectrumError::Transport("not connected".into()));
         }
-        result
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ElectrumError::Transport("connection closed".into())),
+            Err(_) => {
+                self.inner.pending.lock().unwrap().remove(&id);
+                Err(ElectrumError::Transport(format!("{method} timed out")))
+            }
+        }
     }
 
     async fn run(self) {
@@ -229,7 +224,7 @@ impl ElectrumClient {
     /// Run one connection until it fails; returns the reason.
     async fn session(&self, stream: Box<dyn Stream>) -> anyhow::Error {
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let (tx, mut rx) = mpsc::channel::<String>(SEND_QUEUE);
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         *self.inner.writer.lock().unwrap() = Some(tx);
 
         let writer = async move {
@@ -246,7 +241,7 @@ impl ElectrumClient {
             let mut buf = Vec::new();
             loop {
                 buf.clear();
-                if read_line_limited(&mut lines, &mut buf, MAX_MESSAGE_SIZE).await? == 0 {
+                if lines.read_until(b'\n', &mut buf).await? == 0 {
                     return Err(anyhow!("server closed the connection"));
                 }
                 match serde_json::from_slice::<Value>(&buf) {
@@ -288,37 +283,6 @@ impl ElectrumClient {
             r = writer => r.err().map(anyhow::Error::from).unwrap_or_else(|| anyhow!("writer stopped")),
             r = reader => r.err().unwrap_or_else(|| anyhow!("reader stopped")),
             r = handshake_and_ping => r.err().unwrap_or_else(|| anyhow!("ping loop stopped")),
-        }
-    }
-}
-
-/// Like `read_until(b'\n')`, but fails as soon as the line grows past `max`
-/// bytes instead of buffering whatever the server sends.
-async fn read_line_limited<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-    max: usize,
-) -> std::io::Result<usize> {
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(buf.len());
-        }
-        let (chunk, done) = match available.iter().position(|&b| b == b'\n') {
-            Some(i) => (&available[..=i], true),
-            None => (available, false),
-        };
-        if buf.len() + chunk.len() > max {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("server message larger than {max} bytes"),
-            ));
-        }
-        buf.extend_from_slice(chunk);
-        let n = chunk.len();
-        reader.consume(n);
-        if done {
-            return Ok(buf.len());
         }
     }
 }
@@ -407,102 +371,5 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn read_all(input: &[u8], max: usize) -> Vec<std::io::Result<Vec<u8>>> {
-        // A tiny buffer exercises lines that span many reads.
-        let mut reader = BufReader::with_capacity(3, input);
-        let mut out = Vec::new();
-        loop {
-            let mut buf = Vec::new();
-            match read_line_limited(&mut reader, &mut buf, max).await {
-                Ok(0) => return out,
-                Ok(_) => out.push(Ok(buf)),
-                Err(e) => {
-                    out.push(Err(e));
-                    return out;
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn reads_lines_within_limit() {
-        let lines = read_all(b"{\"id\":1}\n[]\n", 16).await;
-        let lines: Vec<_> = lines.into_iter().map(Result::unwrap).collect();
-        assert_eq!(lines, vec![b"{\"id\":1}\n".to_vec(), b"[]\n".to_vec()]);
-    }
-
-    #[tokio::test]
-    async fn line_of_exactly_max_bytes_is_accepted() {
-        let lines = read_all(b"0123456\n", 8).await;
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].is_ok());
-    }
-
-    #[tokio::test]
-    async fn oversized_line_is_rejected_with_bounded_buffer() {
-        let input = vec![b'x'; 1 << 20];
-        let mut reader = BufReader::with_capacity(4096, input.as_slice());
-        let mut buf = Vec::new();
-        let err = read_line_limited(&mut reader, &mut buf, 1000).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(buf.len() <= 1000, "buffered {} bytes", buf.len());
-    }
-
-    #[tokio::test]
-    async fn oversized_line_after_good_ones_is_rejected() {
-        let lines = read_all(b"ok\n0123456789\n", 8).await;
-        assert_eq!(lines[0].as_ref().unwrap(), b"ok\n");
-        assert!(lines[1].is_err());
-    }
-
-    #[tokio::test]
-    async fn truncated_line_is_returned_then_eof() {
-        // The caller fails to parse it and then sees EOF (connection closed).
-        let lines = read_all(b"{\"id\":1,\"res", 64).await;
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].as_ref().unwrap(), b"{\"id\":1,\"res");
-    }
-
-    #[tokio::test]
-    async fn malformed_and_oversized_server_messages_cause_reconnect() {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let client = ElectrumClient::new(&format!("tcp://127.0.0.1:{port}"), None, false).unwrap();
-        let mut status = client.status();
-        client.spawn();
-
-        // First connection: garbage, then a never-ending line.
-        let (mut sock, _) = listener.accept().await.unwrap();
-        let mut req = [0u8; 256];
-        let _ = sock.read(&mut req).await.unwrap();
-        sock.write_all(b"not json\n").await.unwrap();
-        let chunk = vec![b'a'; 1 << 20];
-        let mut sent = 0;
-        while sent <= MAX_MESSAGE_SIZE {
-            if sock.write_all(&chunk).await.is_err() {
-                break; // the client hung up, as it should
-            }
-            sent += chunk.len();
-        }
-        let err = tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.last_error.is_some()))
-            .await
-            .expect("client should drop the connection")
-            .unwrap()
-            .last_error
-            .clone()
-            .unwrap();
-        assert!(err.contains("larger than"), "{err}");
-
-        // The client reconnects afterwards.
-        let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
-        assert!(accepted.is_ok(), "client should reconnect");
     }
 }
