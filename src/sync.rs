@@ -17,7 +17,7 @@ use miniscript::bitcoin::hashes::{Hash, sha256};
 use miniscript::bitcoin::{Network, OutPoint, Script, ScriptBuf, Transaction, Txid, consensus};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
 use crate::config::expected_genesis;
@@ -27,8 +27,6 @@ use crate::store::{Store, WalletRecord};
 use crate::wallet::{Chain, ChainKind, address_of, script_at};
 
 const PARALLEL_REQUESTS: usize = 24;
-/// Block times this close to the tip may change in a reorg, so are refetched.
-const REORG_SAFETY: i64 = 6;
 
 /// Electrum script hash: reversed SHA256 of the output script, hex encoded.
 pub fn script_hash(script: &Script) -> String {
@@ -184,6 +182,41 @@ pub struct Tip {
     pub blake2b: bool,
 }
 
+/// Block times by height, valid for one version of the chain.
+#[derive(Default)]
+struct BlockTimes {
+    by_height: HashMap<i64, u32>,
+    /// Bumped whenever the cache is invalidated by a reorg, so that a sync that
+    /// fetched times from the old chain does not store them afterwards.
+    generation: u64,
+}
+
+/// The last tip header known to be on the server's chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainTip {
+    height: i64,
+    header: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TipChange {
+    /// First tip seen, or the same tip again.
+    Nothing,
+    /// A higher tip: the chain only grew if the old tip header is still at its height.
+    Verify,
+    /// The old tip was replaced or the chain got shorter.
+    Reorg,
+}
+
+fn classify_tip(known: Option<&ChainTip>, new: &ChainTip) -> TipChange {
+    match known {
+        None => TipChange::Nothing,
+        Some(k) if k == new => TipChange::Nothing,
+        Some(k) if new.height > k.height => TipChange::Verify,
+        Some(_) => TipChange::Reorg,
+    }
+}
+
 #[derive(Default)]
 struct Subscriptions {
     epoch: u64,
@@ -199,7 +232,9 @@ pub struct Manager {
     watchers: Mutex<HashMap<String, HashSet<String>>>,
     subs: Mutex<Subscriptions>,
     txs: Mutex<HashMap<Txid, Arc<Transaction>>>,
-    times: Mutex<HashMap<i64, u32>>,
+    times: Mutex<BlockTimes>,
+    /// Latest tip header, consumed in order by the reorg check task.
+    chain_tip: watch::Sender<Option<ChainTip>>,
     first_seen: Mutex<HashMap<Txid, u64>>,
     tip: Mutex<Option<Tip>>,
     chain_error: Mutex<Option<String>>,
@@ -217,7 +252,8 @@ impl Manager {
             watchers: Mutex::new(HashMap::new()),
             subs: Mutex::new(Subscriptions::default()),
             txs: Mutex::new(HashMap::new()),
-            times: Mutex::new(HashMap::new()),
+            times: Mutex::new(BlockTimes::default()),
+            chain_tip: watch::Sender::new(None),
             first_seen: Mutex::new(HashMap::new()),
             tip: Mutex::new(None),
             chain_error: Mutex::new(None),
@@ -303,6 +339,20 @@ impl Manager {
 
     /// Start background tasks: react to (re)connections and server notifications.
     pub fn start(self: &Arc<Self>) {
+        // One task, so tips are checked in the order they arrived. Subscribe
+        // before any connection can report a tip.
+        let mut tips = self.chain_tip.subscribe();
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            let mut known = None;
+            while tips.changed().await.is_ok() {
+                let tip = tips.borrow_and_update().clone();
+                if let Some(tip) = tip {
+                    mgr.check_reorg(&mut known, tip).await;
+                }
+            }
+        });
+
         let mgr = self.clone();
         tokio::spawn(async move {
             let mut status = mgr.client.status();
@@ -363,14 +413,47 @@ impl Manager {
 
     fn set_tip(&self, v: &Value) {
         let Some(height) = v.get("height").and_then(Value::as_i64) else { return };
-        let blake2b = v.get("hex").and_then(Value::as_str).and_then(header::parse_hex).is_some_and(|h| h.v2);
-        let previous = self.tip.lock().unwrap().replace(Tip { height, blake2b });
-        if previous.is_some_and(|p| p.height >= height) {
-            // Reorg (or a repeat): forget block times that may have changed.
-            self.times.lock().unwrap().retain(|h, _| *h < height - REORG_SAFETY);
-        }
+        let hex = v.get("hex").and_then(Value::as_str);
+        let blake2b = hex.and_then(header::parse_hex).is_some_and(|h| h.v2);
+        *self.tip.lock().unwrap() = Some(Tip { height, blake2b });
         debug!("tip {height}");
         self.notify(Event::Status);
+        if let Some(hex) = hex {
+            self.chain_tip.send_replace(Some(ChainTip { height, header: hex.to_ascii_lowercase() }));
+        }
+    }
+
+    /// Detect a change of the active chain, of any depth, and drop every
+    /// cached block time when it happens. `known` is the last verified tip.
+    async fn check_reorg(self: &Arc<Self>, known: &mut Option<ChainTip>, new: ChainTip) {
+        let reorg = match classify_tip(known.as_ref(), &new) {
+            TipChange::Nothing => false,
+            TipChange::Reorg => true,
+            TipChange::Verify => {
+                let old = known.as_ref().expect("verify implies a known tip");
+                match self.client.call("blockchain.block.header", json!([old.height])).await {
+                    Ok(v) => v.as_str().is_none_or(|h| !h.eq_ignore_ascii_case(&old.header)),
+                    Err(e) => {
+                        // Keep the old tip so the next notification checks again.
+                        warn!("checking for a reorg at height {}: {e}", old.height);
+                        return;
+                    }
+                }
+            }
+        };
+        if reorg {
+            let from = known.as_ref().map_or(0, |k| k.height);
+            info!("chain reorganization (tip {from} -> {}); refetching block times", new.height);
+            {
+                let mut times = self.times.lock().unwrap();
+                times.by_height.clear();
+                times.generation += 1;
+            }
+            *known = Some(new);
+            self.sync_all();
+        } else if known.as_ref().is_none_or(|k| k.height < new.height) {
+            *known = Some(new);
+        }
     }
 
     fn on_notification(self: &Arc<Self>, method: &str, params: &Value) {
@@ -578,10 +661,11 @@ impl Manager {
         }
 
         // 4. Block times and first-seen times.
-        let missing_heights: Vec<i64> = {
+        let (generation, missing_heights): (u64, Vec<i64>) = {
             let times = self.times.lock().unwrap();
-            let set: HashSet<i64> = heights.values().copied().filter(|h| *h > 0 && !times.contains_key(h)).collect();
-            set.into_iter().collect()
+            let set: HashSet<i64> =
+                heights.values().copied().filter(|h| *h > 0 && !times.by_height.contains_key(h)).collect();
+            (times.generation, set.into_iter().collect())
         };
         let fetched_times: Vec<(i64, u32)> = stream::iter(missing_heights)
             .map(|h| async move {
@@ -592,7 +676,13 @@ impl Manager {
             .buffer_unordered(PARALLEL_REQUESTS)
             .try_collect()
             .await?;
-        self.times.lock().unwrap().extend(fetched_times);
+        {
+            let mut times = self.times.lock().unwrap();
+            // After a reorg these may be from the old chain; the reorg queued another sync.
+            if times.generation == generation {
+                times.by_height.extend(fetched_times);
+            }
+        }
         {
             let mut first_seen = self.first_seen.lock().unwrap();
             let now = now_secs();
@@ -608,7 +698,7 @@ impl Manager {
             let txs = self.txs.lock().unwrap();
             let times = self.times.lock().unwrap();
             let first_seen = self.first_seen.lock().unwrap();
-            build_snapshot(&st.entries, &st.histories, &txs, &times, &first_seen)
+            build_snapshot(&st.entries, &st.histories, &txs, &times.by_height, &first_seen)
         };
         *w.snapshot.write().unwrap() = Some(Arc::new(snapshot));
         Ok(())
@@ -1147,6 +1237,19 @@ mod tests {
         let order = vec![(b.compute_txid(), 5), (a.compute_txid(), 5)];
         let sorted = topo_within_heights(order, &txs);
         assert_eq!(sorted[0].0, a.compute_txid());
+    }
+
+    #[test]
+    fn tip_changes() {
+        let tip = |height, header: &str| ChainTip { height, header: header.into() };
+        let known = tip(100, "aa");
+        assert_eq!(classify_tip(None, &known), TipChange::Nothing);
+        assert_eq!(classify_tip(Some(&known), &tip(100, "aa")), TipChange::Nothing);
+        assert_eq!(classify_tip(Some(&known), &tip(101, "bb")), TipChange::Verify);
+        assert_eq!(classify_tip(Some(&known), &tip(108, "bb")), TipChange::Verify, "deep reorg to a higher tip");
+        assert_eq!(classify_tip(Some(&known), &tip(100, "cc")), TipChange::Reorg, "same-height replacement");
+        assert_eq!(classify_tip(Some(&known), &tip(99, "cc")), TipChange::Reorg, "shorter chain");
+        assert_eq!(classify_tip(Some(&known), &tip(80, "cc")), TipChange::Reorg, "deeper than any window");
     }
 
     #[test]
