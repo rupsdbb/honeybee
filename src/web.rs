@@ -189,11 +189,15 @@ async fn login(
         return Ok(Json(json!({ "ok": true })).into_response());
     }
     let ip = peer.ip();
-    state.auth.check_rate_limit(ip).map_err(|m| ApiError(StatusCode::TOO_MANY_REQUESTS, m))?;
+    let attempt = state.auth.begin_attempt(ip).map_err(|m| ApiError(StatusCode::TOO_MANY_REQUESTS, m))?;
+    let slot = state.auth.verify_slot().await;
     let auth = state.auth.clone();
     let ok = tokio::task::spawn_blocking(move || auth.verify(&body.password)).await.unwrap_or(false);
-    if !ok {
-        state.auth.record_failure(ip);
+    drop(slot);
+    if ok {
+        attempt.succeeded();
+    } else {
+        drop(attempt);
         tracing::warn!("failed login from {ip}");
         tokio::time::sleep(Duration::from_millis(500)).await;
         return Err(ApiError(StatusCode::UNAUTHORIZED, "Wrong password.".into()));
