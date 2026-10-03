@@ -55,7 +55,7 @@ Open <http://127.0.0.1:8585> and add a wallet.
 To reach it from other machines, set a password and listen on all interfaces:
 
 ```bash
-read -rs PW && echo "$PW" | ./target/release/honeybee hash-password
+PW=$(openssl rand -base64 18); echo "Password: $PW"; echo "$PW" | ./target/release/honeybee hash-password; unset PW
 # -> scrypt$15$8$1$...
 HONEYBEE_PASSWORD_HASH='scrypt$15$8$1$...' ./target/release/honeybee \
   --electrum ssl://electrs.home:50002 --listen 0.0.0.0:8585
